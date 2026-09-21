@@ -2,12 +2,14 @@
 
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from clickhouse_connect.driver.client import Client
 
 from chainlens.db import create_client
+from chainlens.clustering.runner import ClusterRunner
+from chainlens.clustering.store import ClickHouseClusteringStore
 from chainlens.evm.models import EvmBlock
 from chainlens.ingestion.store import ClickHouseStore
 
@@ -21,12 +23,26 @@ BASE_TABLES = {
     "reorg_events",
     "pipeline_runs",
     "pipeline_checkpoints",
+    "wallet_transfer_edges",
+    "wallet_funding_edges",
+    "wallet_features",
+    "entity_resolution_edges",
+    "cluster_evidence",
+    "cluster_runs",
+    "wallet_clusters",
 }
 
 VIEWS = {
     "current_canonical_blocks",
     "canonical_transactions",
     "canonical_token_transfers",
+    "latest_cluster_runs",
+    "current_wallet_clusters",
+    "current_entity_resolution_edges",
+    "current_cluster_evidence",
+    "current_wallet_features",
+    "current_wallet_funding_edges",
+    "current_wallet_transfer_edges",
 }
 
 
@@ -302,3 +318,142 @@ def test_milestone2_store_uses_current_state_and_idempotent_versions(
     )
     assert checkpoint == first_checkpoint == second_checkpoint
     assert history_count == 1
+
+
+def test_clustering_reads_only_canonical_facts(client: Client, chain_id: int) -> None:
+    """An orphaned raw transaction must not enter the intelligence snapshot."""
+
+    now = datetime.now(UTC)
+    client.insert(
+        "chainlens.canonical_blocks",
+        [(chain_id, 700, "canonical", "parent", "safe", now, 1)],
+        column_names=[
+            "chain_id", "block_number", "block_hash", "parent_hash",
+            "security_level", "observed_at", "version",
+        ],
+    )
+    rows = []
+    for block_hash, tx_hash in (("orphan", "orphan_tx"), ("canonical", "canonical_tx")):
+        rows.append(
+            (
+                chain_id, 700, block_hash, now, tx_hash, 0,
+                "0x" + "11" * 20, "0x" + "22" * 20,
+                1, 21_000, 1, "0x", 1, now,
+            )
+        )
+    client.insert(
+        "chainlens.raw_transactions",
+        rows,
+        column_names=[
+            "chain_id", "block_number", "block_hash", "block_timestamp", "tx_hash",
+            "tx_index", "from_address", "to_address", "value_wei", "gas",
+            "gas_price", "input", "status", "ingested_at",
+        ],
+    )
+
+    transactions = ClickHouseClusteringStore(client).read_canonical_transactions(
+        chain_id, 700, 700
+    )
+    assert [transaction.tx_hash for transaction in transactions] == ["canonical_tx"]
+
+
+def test_clustering_snapshots_are_historical_and_current_views_select_latest(
+    client: Client, chain_id: int
+) -> None:
+    """Completed snapshots remain queryable while failed runs never become current."""
+
+    now = datetime.now(UTC)
+    funder = "0x" + "11" * 20
+    wallet_a = "0x" + "22" * 20
+    wallet_b = "0x" + "33" * 20
+    canonical_rows = [
+        (chain_id, 800, "block_800", "parent", "safe", now, 1),
+        (chain_id, 801, "block_801", "block_800", "safe", now, 1),
+    ]
+    client.insert(
+        "chainlens.canonical_blocks",
+        canonical_rows,
+        column_names=[
+            "chain_id", "block_number", "block_hash", "parent_hash",
+            "security_level", "observed_at", "version",
+        ],
+    )
+    client.insert(
+        "chainlens.raw_transactions",
+        [
+            (
+                chain_id, 800, "block_800", now, "fund_a", 0, funder, wallet_a,
+                10, 21_000, 1, "0x", 1, now,
+            ),
+            (
+                chain_id, 801, "block_801", now, "fund_b", 0, funder, wallet_b,
+                10, 21_000, 1, "0x", 1, now,
+            ),
+        ],
+        column_names=[
+            "chain_id", "block_number", "block_hash", "block_timestamp", "tx_hash",
+            "tx_index", "from_address", "to_address", "value_wei", "gas",
+            "gas_price", "input", "status", "ingested_at",
+        ],
+    )
+
+    store = ClickHouseClusteringStore(client)
+    runner = ClusterRunner(store, window_seconds=3600, max_fanout=20)
+    run_a = UUID(runner.run(chain_id, 800, 801).run_id)
+    run_b = UUID(runner.run(chain_id, 800, 801).run_id)
+    assert run_a != run_b
+
+    for table, run_column, expected_rows in (
+        ("wallet_clusters", "cluster_run_id", 2),
+        ("entity_resolution_edges", "run_id", 1),
+        ("cluster_evidence", "run_id", 3),
+    ):
+        counts = dict(
+            client.query(
+                f"SELECT {run_column}, count() FROM chainlens.{table} "
+                "WHERE chain_id = {chain_id:UInt64} GROUP BY " + run_column,
+                parameters={"chain_id": chain_id},
+            ).result_rows
+        )
+        assert counts == {run_a: expected_rows, run_b: expected_rows}
+
+    latest = client.query(
+        "SELECT run_id FROM chainlens.latest_cluster_runs "
+        "WHERE chain_id = {chain_id:UInt64} AND start_block = 800 "
+        "AND end_block = 801 AND heuristic_version = 'shared_funder_v1'",
+        parameters={"chain_id": chain_id},
+    ).first_row[0]
+    assert latest == run_b
+
+    assert client.query(
+        "SELECT DISTINCT cluster_run_id FROM chainlens.current_wallet_clusters "
+        "WHERE chain_id = {chain_id:UInt64}",
+        parameters={"chain_id": chain_id},
+    ).result_rows == [(run_b,)]
+    assert client.query(
+        "SELECT DISTINCT run_id FROM chainlens.current_entity_resolution_edges "
+        "WHERE chain_id = {chain_id:UInt64}",
+        parameters={"chain_id": chain_id},
+    ).result_rows == [(run_b,)]
+    assert client.query(
+        "SELECT DISTINCT run_id FROM chainlens.current_cluster_evidence "
+        "WHERE chain_id = {chain_id:UInt64}",
+        parameters={"chain_id": chain_id},
+    ).result_rows == [(run_b,)]
+    assert client.query(
+        "SELECT count() FROM chainlens.wallet_clusters "
+        "WHERE cluster_run_id = {run_id:UUID}",
+        parameters={"run_id": str(run_a)},
+    ).first_row[0] == 2
+
+    run_c = uuid4()
+    store.write_run_state(run_c, chain_id, 800, 801, "pending", now, 1)
+    store.write_run_state(run_c, chain_id, 800, 801, "running", now, 2)
+    store.write_run_state(
+        run_c, chain_id, 800, 801, "failed", now, 3, error="deliberate test failure"
+    )
+    assert client.query(
+        "SELECT run_id FROM chainlens.latest_cluster_runs "
+        "WHERE chain_id = {chain_id:UInt64} AND start_block = 800 AND end_block = 801",
+        parameters={"chain_id": chain_id},
+    ).result_rows == [(run_b,)]

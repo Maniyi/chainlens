@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     reorg_max_depth: PositiveInt = Field(
         default=128, validation_alias="REORG_MAX_DEPTH"
     )
+    cluster_shared_funder_window_seconds: PositiveInt = Field(
+        default=3600,
+        validation_alias="CLUSTER_SHARED_FUNDER_WINDOW_SECONDS",
+    )
+    cluster_max_funder_fanout: PositiveInt = Field(
+        default=20,
+        validation_alias="CLUSTER_MAX_FUNDER_FANOUT",
+    )
 
 
 @lru_cache
