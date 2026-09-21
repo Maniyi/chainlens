@@ -8,6 +8,8 @@ import pytest
 from clickhouse_connect.driver.client import Client
 
 from chainlens.db import create_client
+from chainlens.evm.models import EvmBlock
+from chainlens.ingestion.store import ClickHouseStore
 
 
 BASE_TABLES = {
@@ -265,3 +267,38 @@ def test_checkpoint_retains_height_and_hash(client: Client, chain_id: int) -> No
         ")"
     ).result_rows
     assert checkpoint == [(100, "BBB")]
+
+
+def test_milestone2_store_uses_current_state_and_idempotent_versions(
+    client: Client, chain_id: int
+) -> None:
+    """The ingestion adapter round-trips through the existing versioned schema."""
+
+    store = ClickHouseStore(client)
+    now = datetime.now(UTC)
+    block = EvmBlock(500, "0xabc", "0xparent", now)
+
+    store.write_raw_facts(chain_id, block, [], [], now)
+    assert store.set_canonical(chain_id, block, "safe", "observed", now)
+    assert not store.set_canonical(chain_id, block, "safe", "observed", now)
+    first_checkpoint = store.write_checkpoint(
+        "block_ingestion", chain_id, block.number, block.block_hash
+    )
+    second_checkpoint = store.write_checkpoint(
+        "block_ingestion", chain_id, block.number, block.block_hash
+    )
+
+    current = store.get_canonical_block(chain_id, block.number)
+    checkpoint = store.get_checkpoint("block_ingestion", chain_id)
+    history_count = client.query(
+        "SELECT count() FROM chainlens.canonical_blocks_history "
+        f"WHERE chain_id = {chain_id} AND block_number = {block.number}"
+    ).first_row[0]
+    assert current is not None
+    assert (current.block_hash, current.security_level, current.version) == (
+        block.block_hash,
+        "safe",
+        1,
+    )
+    assert checkpoint == first_checkpoint == second_checkpoint
+    assert history_count == 1

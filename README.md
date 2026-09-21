@@ -1,22 +1,25 @@
 # ChainLens
 
-ChainLens is a portfolio project for building a small, production-style blockchain
-wallet intelligence platform. This first milestone provides only the Python project
-foundation, ClickHouse service, initial ingestion tables, and connectivity checks.
+ChainLens is a small, production-style blockchain data project. Milestone 2 adds
+bounded Base/EVM ingestion to the fork-aware ClickHouse foundation from Milestone 1.
 
 ## Architecture scope
 
-Milestone 1 contains:
+The implemented scope contains:
 
 - a single local ClickHouse server managed by Docker Compose;
 - fork-aware tables for observed EVM blocks, transactions, and token transfers;
 - canonical block state, its audit history, and reorganization event metadata;
 - versioned pipeline run and block-hash-aware checkpoint tables;
 - Python configuration and a small ClickHouse client factory;
-- a command-line health check and an integration connectivity test.
+- direct Ethereum JSON-RPC ingestion through `httpx`;
+- ERC-20 `Transfer(address,address,uint256)` decoding from transaction receipts;
+- resumable bounded backfills, protocol finality tracking, and ancestry-based reorg
+  recovery;
+- a command-line health check plus deterministic unit and integration tests.
 
-Later ingestion, graph, clustering, labeling, evaluation, and GraphQL capabilities
-are intentionally outside this milestone.
+Graph construction, clustering, labeling, GraphQL, streaming, and frontend work are
+intentionally outside this milestone.
 
 ## Local setup
 
@@ -32,7 +35,15 @@ python -m pip install -e '.[dev]'
 cp .env.example .env
 ```
 
-The defaults work with the Compose service, so creating `.env` is optional.
+The ClickHouse defaults work with Compose. RPC ingestion additionally requires a
+Base endpoint in `.env` (credentials belong only in that ignored local file):
+
+```dotenv
+BASE_RPC_URL=https://your-base-rpc.example
+RPC_TIMEOUT_SECONDS=20
+RPC_BATCH_SIZE=20
+REORG_MAX_DEPTH=128
+```
 
 ## Start ClickHouse
 
@@ -91,7 +102,88 @@ Current canonical state:
 102 -> Y
 ```
 
-The RPC ingestion and reorg-detection logic is not implemented in Milestone 1.
+## Run a bounded backfill
+
+The endpoint chain ID is checked before any blockchain facts are ingested. Base
+mainnet is chain ID `8453`. Both bounds are required; the command never defaults to
+genesis or starts a live follower.
+
+```bash
+python -m chainlens.ingestion.runner backfill \
+  --chain-id 8453 \
+  --from-block 20000000 \
+  --to-block 20000019
+```
+
+For each block the write order is raw block, raw transactions, token transfers,
+canonical current state, canonical history, then checkpoint. ClickHouse does not
+offer a multi-table transaction for this workflow, so the checkpoint is deliberately
+last: a crash before it can safely replay the block. ReplacingMergeTree may contain
+temporary physical duplicates, but logical identities and all current-state reads
+remain idempotent without relying on `FINAL`.
+
+## Reorg recovery and finality
+
+Each new block's parent hash is compared with the preceding stored canonical hash.
+A conflicting block at an already canonical height is also a reorg signal. Recovery
+walks the RPC branch backward and compares hashes at equal heights using the
+`current_canonical_blocks` (`argMax`) view. It stops at a common ancestor or fails
+once `REORG_MAX_DEPTH` is exceeded.
+
+Recovery retains every orphaned row in `raw_blocks`, `raw_transactions`, and
+`token_transfers`. It appends non-canonical audit entries for the old branch, ingests
+and selects the replacement branch, writes one `reorg_events` summary, and repairs
+the hash-aware checkpoint. Resume always re-fetches the checkpoint height and
+recovers first if its hash changed; it never trusts height alone.
+
+Security levels come from Base/OP Stack's `latest`, `safe`, and `finalized` RPC tags,
+not a confirmation count. A block at or below the finalized head is `finalized`; a
+block above finalized and at or below safe is `safe`; newer blocks are `unsafe`.
+Security upgrades append newer canonical versions and history rather than rewriting
+raw facts.
+
+## Inspect ingestion state
+
+Current canonical blocks:
+
+```sql
+SELECT * FROM chainlens.current_canonical_blocks
+WHERE chain_id = 8453 ORDER BY block_number;
+```
+
+Canonical transactions:
+
+```sql
+SELECT block_number, tx_hash, status
+FROM chainlens.canonical_transactions
+WHERE chain_id = 8453 ORDER BY block_number, tx_index;
+```
+
+All observed forks at one height (including orphaned observations):
+
+```sql
+SELECT block_number, block_hash, parent_hash, max(ingested_at)
+FROM chainlens.raw_blocks
+WHERE chain_id = 8453 AND block_number = 20000000
+GROUP BY block_number, block_hash, parent_hash;
+```
+
+Reorg events:
+
+```sql
+SELECT * FROM chainlens.reorg_events
+WHERE chain_id = 8453 ORDER BY detected_at DESC;
+```
+
+Current checkpoint without assuming background merges:
+
+```sql
+SELECT argMax(
+  tuple(last_processed_block, last_processed_block_hash, updated_at), version
+) AS checkpoint
+FROM chainlens.pipeline_checkpoints
+WHERE job_name = 'block_ingestion' AND chain_id = 8453;
+```
 
 ## Run the health check
 
@@ -106,3 +198,6 @@ With ClickHouse running:
 ```bash
 pytest
 ```
+
+The deterministic tests use mocked RPC behavior. A real endpoint is needed only for
+manual backfill validation.
