@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chainlens"
+version = "0.1.0"
+description = "A production-style blockchain wallet intelligence portfolio project"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "clickhouse-connect>=0.8,<1.0",
+    "pydantic-settings>=2.0,<3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<9.0"]
+
+[tool.setuptools.packages.find]
+include = ["chainlens*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
