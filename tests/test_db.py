@@ -12,6 +12,10 @@ from clickhouse_connect.driver.client import Client
 from chainlens.db import create_client
 from chainlens.clustering.runner import ClusterRunner
 from chainlens.clustering.store import ClickHouseClusteringStore
+from chainlens.evaluation.logic import EVALUATION_VERSION
+from chainlens.evaluation.models import DriftThresholds
+from chainlens.evaluation.runner import EvaluationRunner
+from chainlens.evaluation.store import ClickHouseEvaluationStore
 from chainlens.evm.models import EvmBlock
 from chainlens.ingestion.store import ClickHouseStore
 from chainlens.labels.runner import LabelRunner
@@ -41,6 +45,11 @@ BASE_TABLES = {
     "label_assignments",
     "label_evidence",
     "label_conflicts",
+    "evaluation_runs",
+    "label_evaluations",
+    "clustering_evaluations",
+    "drift_metrics",
+    "drift_alerts",
 }
 
 GLOBAL_TABLES = {"label_taxonomy"}
@@ -62,6 +71,11 @@ VIEWS = {
     "current_label_assignments",
     "current_label_evidence",
     "current_label_conflicts",
+    "latest_evaluation_runs",
+    "current_label_evaluations",
+    "current_clustering_evaluations",
+    "current_drift_metrics",
+    "current_drift_alerts",
 }
 
 
@@ -548,6 +562,100 @@ def test_label_snapshots_are_historical_and_failed_runs_do_not_become_current(
     )
     assert client.query(
         "SELECT run_id FROM chainlens.latest_label_runs "
+        "WHERE chain_id = {chain_id:UInt64}",
+        parameters={"chain_id": chain_id},
+    ).result_rows == [(UUID(second.run_id),)]
+
+
+def test_evaluation_history_and_current_views_exclude_failed_runs(
+    client: Client, chain_id: int, tmp_path: Path
+) -> None:
+    now = datetime.now(UTC)
+    funder = "0x" + "11" * 20
+    wallet_a = "0x" + "22" * 20
+    wallet_b = "0x" + "33" * 20
+    client.insert(
+        "chainlens.canonical_blocks",
+        [
+            (chain_id, 900, "eval_900", "parent", "safe", now, 1),
+            (chain_id, 901, "eval_901", "eval_900", "safe", now, 1),
+        ],
+        column_names=[
+            "chain_id", "block_number", "block_hash", "parent_hash",
+            "security_level", "observed_at", "version",
+        ],
+    )
+    client.insert(
+        "chainlens.raw_transactions",
+        [
+            (chain_id, 900, "eval_900", now, "eval_a", 0, funder, wallet_a,
+             10, 21_000, 1, "0x", 1, now),
+            (chain_id, 901, "eval_901", now, "eval_b", 0, funder, wallet_b,
+             10, 21_000, 1, "0x", 1, now),
+        ],
+        column_names=[
+            "chain_id", "block_number", "block_hash", "block_timestamp", "tx_hash",
+            "tx_index", "from_address", "to_address", "value_wei", "gas",
+            "gas_price", "input", "status", "ingested_at",
+        ],
+    )
+    cluster_run_id = UUID(
+        ClusterRunner(
+            ClickHouseClusteringStore(client), window_seconds=3600, max_fanout=20
+        ).run(chain_id, 900, 901).run_id
+    )
+
+    seed_path = tmp_path / "evaluation-seeds.csv"
+    with seed_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REQUIRED_COLUMNS)
+        writer.writeheader()
+        for wallet, role in ((wallet_a, "router"), (wallet_b, "factory")):
+            writer.writerow({
+                "chain_id": chain_id,
+                "address": wallet,
+                "entity_name": "Known Test Entity",
+                "entity_category": "protocol",
+                "contract_role": role,
+                "source_type": "test_fixture",
+                "source_reference": "evaluation integration test",
+                "confidence": 1.0,
+                "notes": role,
+            })
+    label_run_id = UUID(
+        LabelRunner(ClickHouseLabelStore(client), propagation_factor=0.95).run(
+            chain_id, seed_path, cluster_run_id=cluster_run_id
+        ).run_id
+    )
+    store = ClickHouseEvaluationStore(client)
+    runner = EvaluationRunner(store, thresholds=DriftThresholds())
+    first = runner.run(chain_id, cluster_run_id, label_run_id, seed_path)
+    second = runner.run(chain_id, cluster_run_id, label_run_id, seed_path)
+    assert first.run_id != second.run_id
+    assert first.clustering_evaluation.pairwise_f1 == 1.0
+    assert first.ground_truth_version == second.ground_truth_version
+    assert client.query(
+        "SELECT uniqExact(evaluation_run_id) FROM chainlens.clustering_evaluations "
+        "WHERE chain_id = {chain_id:UInt64}",
+        parameters={"chain_id": chain_id},
+    ).first_row[0] == 2
+    assert client.query(
+        "SELECT DISTINCT evaluation_run_id FROM chainlens.current_clustering_evaluations "
+        "WHERE chain_id = {chain_id:UInt64}",
+        parameters={"chain_id": chain_id},
+    ).result_rows == [(UUID(second.run_id),)]
+
+    scope = store.read_scope(chain_id, cluster_run_id, label_run_id)
+    failed = uuid4()
+    store.write_run_state(
+        failed, scope, second.ground_truth_version, EVALUATION_VERSION,
+        "pending", now, 1,
+    )
+    store.write_run_state(
+        failed, scope, second.ground_truth_version, EVALUATION_VERSION,
+        "failed", now, 2, error="deliberate evaluation failure",
+    )
+    assert client.query(
+        "SELECT run_id FROM chainlens.latest_evaluation_runs "
         "WHERE chain_id = {chain_id:UInt64}",
         parameters={"chain_id": chain_id},
     ).result_rows == [(UUID(second.run_id),)]

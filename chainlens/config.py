@@ -43,6 +43,32 @@ class Settings(BaseSettings):
         le=1.0,
         validation_alias="LABEL_PROPAGATION_FACTOR",
     )
+    drift_max_largest_cluster_relative_increase: float = Field(
+        default=1.0,
+        gt=0.0,
+        validation_alias="DRIFT_MAX_LARGEST_CLUSTER_RELATIVE_INCREASE",
+    )
+    drift_cluster_count_drop_threshold: float = Field(
+        default=0.5,
+        gt=0.0,
+        le=1.0,
+        validation_alias="DRIFT_CLUSTER_COUNT_DROP_THRESHOLD",
+    )
+    drift_propagated_label_spike_threshold: float = Field(
+        default=1.0,
+        gt=0.0,
+        validation_alias="DRIFT_PROPAGATED_LABEL_SPIKE_THRESHOLD",
+    )
+    drift_conflict_count_threshold: PositiveInt = Field(
+        default=1,
+        validation_alias="DRIFT_CONFLICT_COUNT_THRESHOLD",
+    )
+    drift_seed_coverage_drop_threshold: float = Field(
+        default=0.2,
+        gt=0.0,
+        le=1.0,
+        validation_alias="DRIFT_SEED_COVERAGE_DROP_THRESHOLD",
+    )
 
 
 @lru_cache

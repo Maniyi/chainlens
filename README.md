@@ -1,8 +1,8 @@
 # ChainLens
 
-ChainLens is a small, production-style blockchain data project. Milestone 4 adds a
-versioned, provenance-first entity and wallet-labeling layer to the fork-aware
-Base/EVM ingestion and bounded wallet-intelligence layers.
+ChainLens is a small, production-style blockchain data project. Milestone 5 adds a
+scoped evaluation and deterministic drift-monitoring layer to the fork-aware
+Base/EVM ingestion, wallet-intelligence, and entity-labeling layers.
 
 ## Architecture scope
 
@@ -23,11 +23,14 @@ The implemented scope contains:
 - curated entity/address labels, explicit memberships, evidence, confidence, and
   conservative cluster-based category propagation;
 - immutable label snapshots plus latest-completed read models;
+- separate direct/inferred label evaluation, pairwise clustering evaluation,
+  coverage statistics, operational drift metrics, and rule-based alerts;
+- immutable evaluation history plus latest-completed compatible-scope views;
 - a command-line health check plus deterministic unit and integration tests.
 
 MEV/searcher/sniper/bot classifiers, deposit-address and common-spending heuristics,
-ML, GraphQL, streaming, evaluation/drift monitoring, and frontend work remain
-outside this milestone.
+ML, GraphQL, streaming, alert delivery, and frontend work remain outside this
+milestone.
 
 ## Local setup
 
@@ -54,6 +57,11 @@ REORG_MAX_DEPTH=128
 CLUSTER_SHARED_FUNDER_WINDOW_SECONDS=3600
 CLUSTER_MAX_FUNDER_FANOUT=20
 LABEL_PROPAGATION_FACTOR=0.95
+DRIFT_MAX_LARGEST_CLUSTER_RELATIVE_INCREASE=1.0
+DRIFT_CLUSTER_COUNT_DROP_THRESHOLD=0.5
+DRIFT_PROPAGATED_LABEL_SPIKE_THRESHOLD=1.0
+DRIFT_CONFLICT_COUNT_THRESHOLD=1
+DRIFT_SEED_COVERAGE_DROP_THRESHOLD=0.2
 ```
 
 ## Start ClickHouse
@@ -98,6 +106,12 @@ docker compose exec -T clickhouse clickhouse-client \
   --password chainlens \
   --database chainlens \
   --multiquery < warehouse/migrations/005_entity_labels.sql
+
+docker compose exec -T clickhouse clickhouse-client \
+  --user chainlens \
+  --password chainlens \
+  --database chainlens \
+  --multiquery < warehouse/migrations/006_evaluation_and_drift.sql
 ```
 
 Migration `002` drops and recreates the affected ingestion and pipeline tables. This
@@ -466,6 +480,143 @@ SELECT entity_id, display_name, created_from
 FROM chainlens.current_entities
 WHERE chain_id = 8453 AND entity_category = 'dex'
 ORDER BY display_name, entity_id;
+```
+
+## Evaluation and drift monitoring
+
+Evaluation is split into three targets because they answer different questions:
+
+- **Label evaluation** checks address-level `entity_category` and `contract_role`
+  assignments against curated truth. `direct_seed` and `cluster_propagation` are
+  always separate. Direct results are data-loading correctness checks, not evidence
+  that inference works. Predictions on subjects with no curated truth are counted as
+  predictions but are not called false positives because their correctness is
+  unknown.
+- **Clustering evaluation** uses pairwise precision, recall, and F1 among curated
+  addresses that were actually seen in the selected clustering run's wallet scope.
+  A true-positive pair has the same curated entity and predicted cluster; a
+  false-positive pair crosses curated entities in one predicted cluster; a
+  false-negative pair belongs to one curated entity but is split or unclustered.
+  Unknown-identity pairs and true negatives are excluded. Pairwise metrics directly
+  measure erroneous merges and splits and do not reward the many unrelated pairs.
+- **Operational drift** describes snapshot size, cluster-size distribution,
+  confidence, label counts/distributions, conflicts, and seed overlap. Coverage says
+  how much curated truth intersects the selected data; it is not accuracy.
+
+Precision is the fraction of evaluable predictions that are correct. Recall is the
+fraction of curated positives recovered. F1 is their harmonic mean. A denominator
+of zero produces SQL `NULL`, not a manufactured zero. For example, zero propagated
+labels gives undefined precision, while recall is zero when curated positives exist.
+Clustering precision/recall/F1 are all undefined when no curated address pairs are in
+scope.
+
+The deterministic ground-truth version is the normalized semantic `sha256:` digest
+already used for seed datasets, not a filename. `evaluation_v1` explicitly versions
+metric semantics. Evaluation runs append pending/running/completed/failed state,
+and all result rows remain immutable and scoped by `evaluation_run_id`.
+`latest_evaluation_runs` resolves the newest completed run for the exact compatible
+chain, block range, heuristic version, taxonomy version, ground-truth version, and
+evaluation version. Failed runs never replace current results. The four
+`current_*` evaluation views join to that completed snapshot; historical tables stay
+directly queryable.
+
+Coverage metrics include seed count, seeds seen in the selected wallet scope, seeds
+present in candidate clusters, directly labeled curated addresses, and curated
+addresses with inferred labels. Drift metrics also record wallet/edge/cluster counts,
+largest/average/median/p95 cluster size, average cluster confidence, entity/direct/
+propagated/conflict counts, average propagated confidence, and label counts by
+dimension/value.
+
+Alerting is deterministic and deliberately small: largest-cluster expansion,
+cluster-count collapse while wallet count is stable, propagation spikes, conflict
+increases, and seed seen/cluster-overlap drops. Environment settings control the
+guardrails. They are operational thresholds, not statistical hypothesis tests or
+claims of significance. No external notification delivery is implemented.
+
+**Current evaluation results are limited by the small curated ground-truth set and
+should not be interpreted as whole-chain accuracy.** The current seeds mostly name
+protocol contracts rather than ordinary wallets. Zero cluster overlap therefore
+means there is no pairwise support, not that clustering is perfect or broken. The
+system does not estimate whole-chain recall or production-grade statistical
+confidence.
+
+Run an evaluation only with explicit, completed snapshot IDs:
+
+```bash
+python -m chainlens.evaluation.runner run \
+  --chain-id 8453 \
+  --cluster-run-id <completed-cluster-run-uuid> \
+  --label-run-id <completed-label-run-uuid> \
+  --ground-truth data/ground_truth/base_known_addresses.csv
+```
+
+The selected label run must reference the selected cluster run. Repeating identical
+inputs creates another historical evaluation execution with deterministic logical
+metrics; it does not overwrite the earlier snapshot.
+
+Latest evaluation execution:
+
+```sql
+SELECT * FROM chainlens.latest_evaluation_runs
+WHERE chain_id = 8453
+ORDER BY completed_at DESC;
+```
+
+Label precision, recall, F1, support, predictions, and coverage:
+
+```sql
+SELECT label_dimension, label_value, assignment_method,
+       tp, fp, fn, precision, recall, f1, support, predicted_count, coverage
+FROM chainlens.current_label_evaluations
+WHERE chain_id = 8453
+ORDER BY assignment_method, label_dimension, label_value;
+```
+
+Pairwise clustering support and metrics:
+
+```sql
+SELECT metric_scope, ground_truth_address_count, evaluated_address_count,
+       tp_pairs, fp_pairs, fn_pairs,
+       pairwise_precision, pairwise_recall, pairwise_f1
+FROM chainlens.current_clustering_evaluations
+WHERE chain_id = 8453;
+```
+
+Coverage, largest-cluster drift, and label-distribution drift:
+
+```sql
+SELECT metric_name, value, previous_value, absolute_change, relative_change
+FROM chainlens.current_drift_metrics
+WHERE chain_id = 8453 AND metric_group = 'coverage'
+ORDER BY metric_name;
+
+SELECT value, previous_value, relative_change
+FROM chainlens.current_drift_metrics
+WHERE chain_id = 8453 AND metric_name = 'largest_cluster_size';
+
+SELECT scope_key, value, previous_value, relative_change
+FROM chainlens.current_drift_metrics
+WHERE chain_id = 8453 AND metric_name = 'label_count'
+ORDER BY scope_key;
+```
+
+Alerts and one exact historical evaluation:
+
+```sql
+SELECT severity, metric_name, scope_key, current_value, previous_value,
+       threshold_type, threshold_value, message
+FROM chainlens.current_drift_alerts
+WHERE chain_id = 8453
+ORDER BY severity DESC, metric_name;
+
+SELECT * FROM chainlens.label_evaluations
+WHERE evaluation_run_id = '<evaluation-run-id>';
+SELECT * FROM chainlens.clustering_evaluations
+WHERE evaluation_run_id = '<evaluation-run-id>';
+SELECT * FROM chainlens.drift_metrics
+WHERE evaluation_run_id = '<evaluation-run-id>';
+SELECT * FROM chainlens.drift_alerts
+WHERE evaluation_run_id = '<evaluation-run-id>';
 ```
 
 ## Inspect ingestion state
