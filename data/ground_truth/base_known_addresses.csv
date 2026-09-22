@@ -1,0 +1,18 @@
+chain_id,address,entity_name,entity_category,contract_role,source_type,source_reference,confidence,notes
+8453,0x2626664c2603336e57b271c5c0b26f421741e481,Uniswap,dex,router,official_docs,Uniswap Base v3 deployments,1.0,Official Base SwapRouter02
+8453,0x6ff5693b99212da76ad316178a184ab56d299b43,Uniswap,dex,router,official_docs,Uniswap Base deployments,1.0,Official Universal Router
+8453,0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24,Uniswap,dex,router,official_docs,Uniswap v2 deployments,1.0,Official Base V2Router02
+8453,0x33128a8fc17869897dce68ed026d694621f6fdfd,Uniswap,dex,factory,official_docs,Uniswap Base v3 deployments,1.0,Official UniswapV3Factory
+8453,0x8909dc15e40173ff4699343b6eb8132c65e18ec6,Uniswap,dex,factory,official_docs,Uniswap v2 deployments,1.0,Official Base v2 factory
+8453,0x498581ff718922c3f8e6a244956af099b2652b2b,Uniswap,dex,pool_manager,official_docs,Uniswap v4 deployments,1.0,Official Base v4 PoolManager
+8453,0xfdf682f51fe81aa4898f0ae2163d8a55c127fbc7,Uniswap,dex,router,official_docs,Uniswap v4 deployments,1.0,Official Universal Router 2.1.1
+8453,0x7c5f5a4bbd8fd63184577525326123b519429bdc,Uniswap,dex,position_manager,official_docs,Uniswap v4 deployments,1.0,Official Base v4 PositionManager
+8453,0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43,Aerodrome,dex,router,official_repo,Aerodrome contracts repository,1.0,Official Aerodrome router
+8453,0x420dd381b31aef6683db6b902084cb0ffece40da,Aerodrome,dex,factory,official_repo,Aerodrome contracts repository,1.0,Official Aerodrome PoolFactory
+8453,0x5c3f18f06cc09ca1910767a34a20f771039e37c0,Aerodrome,dex,factory,official_repo,Aerodrome contracts repository,1.0,Official Aerodrome FactoryRegistry
+8453,0x16613524e02ad97edfef371bc883f2f5d6c480a5,Aerodrome,dex,protocol_contract,official_repo,Aerodrome contracts repository,1.0,Official Aerodrome Voter
+8453,0xeb018363f0a9af8f91f06fee6613a751b2a33fe5,Aerodrome,dex,protocol_contract,official_repo,Aerodrome contracts repository,1.0,Official Aerodrome Minter
+8453,0x940181a94a35a4569e4529a3cdfb74e38fd98631,Aerodrome,dex,token_contract,official_repo,Aerodrome contracts repository,1.0,Official AERO token
+8453,0x4200000000000000000000000000000000000006,Base WETH,protocol,token_contract,official_docs,Uniswap Base deployment docs,1.0,Canonical WETH on Base
+8453,0x833589fcd6edb6e08f4c7c32d4f71b54bda02913,Circle,token_issuer,token_contract,official_base_repo,Base skills reference,1.0,USDC on Base
+8453,0x000000000022d473030f116ddee9f6b43ac78ba3,Uniswap,dex,protocol_contract,official_docs,Uniswap Base deployments,1.0,Permit2 deployment

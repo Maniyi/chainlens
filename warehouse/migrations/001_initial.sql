@@ -2,9 +2,10 @@
 
 CREATE DATABASE IF NOT EXISTS chainlens;
 
--- Blocks are commonly read by chain and block range. ReplacingMergeTree collapses
--- repeated ingestion of the same observed block hash; different hashes at the same
--- height remain separate facts and are not resolved as a reorg by this table.
+-- Blocks are commonly read by chain and block range. ReplacingMergeTree allows a
+-- later ingestion of the same logical block to supersede an earlier row (for
+-- example after a reorg) once background merges occur. Queries that require an
+-- immediate single version should resolve by max(ingested_at), not default to FINAL.
 CREATE TABLE IF NOT EXISTS chainlens.raw_blocks
 (
     chain_id UInt64,
@@ -18,8 +19,9 @@ CREATE TABLE IF NOT EXISTS chainlens.raw_blocks
 ENGINE = ReplacingMergeTree(ingested_at)
 ORDER BY (chain_id, block_number, block_hash);
 
--- This is the historical Milestone 1 transaction layout. Later migrations evolve
--- its ordering for block-range scans and explicit fork-aware canonical reads.
+-- The sorting key is the logical transaction identity. It makes transaction hash
+-- lookups efficient and gives replacement semantics to idempotent re-ingestion.
+-- A single unpartitioned layout is deliberate for the initial local data volume.
 CREATE TABLE IF NOT EXISTS chainlens.raw_transactions
 (
     chain_id UInt64,
@@ -38,10 +40,11 @@ CREATE TABLE IF NOT EXISTS chainlens.raw_transactions
     ingested_at DateTime64(3, 'UTC')
 )
 ENGINE = ReplacingMergeTree(ingested_at)
-ORDER BY (chain_id, block_number, tx_index, tx_hash);
+ORDER BY (chain_id, block_number, block_hash, tx_index, tx_hash);
 
--- This is the historical Milestone 1 transfer layout. Later migrations evolve its
--- ordering for block-range scans and explicit fork-aware canonical reads.
+-- Transfer events are uniquely located by transaction hash and log index. Keeping
+-- that identity in ORDER BY enables idempotent replacement and efficient event or
+-- transaction-level retrieval without creating many small local partitions.
 CREATE TABLE IF NOT EXISTS chainlens.token_transfers
 (
     chain_id UInt64,
@@ -57,7 +60,30 @@ CREATE TABLE IF NOT EXISTS chainlens.token_transfers
     ingested_at DateTime64(3, 'UTC')
 )
 ENGINE = ReplacingMergeTree(ingested_at)
-ORDER BY (chain_id, block_number, tx_hash, log_index);
+ORDER BY (chain_id, block_number, block_hash, tx_hash, log_index);
+
+
+CREATE TABLE chainlens.canonical_blocks
+(
+    chain_id UInt64,
+    block_number UInt64,
+
+    block_hash String,
+    parent_hash String,
+
+    security_level Enum8(
+        'unsafe' = 1,
+        'safe' = 2,
+        'finalized' = 3
+    ),
+
+    observed_at DateTime64(3, 'UTC'),
+
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (chain_id, block_number);
+
 
 -- Pipeline runs are a small operational history. MergeTree keeps every run, while
 -- job/chain/time ordering supports recent-run inspection without partition churn.
@@ -90,8 +116,10 @@ CREATE TABLE IF NOT EXISTS chainlens.pipeline_checkpoints
     job_name LowCardinality(String),
     chain_id UInt64,
     last_processed_block UInt64,
+    last_processed_block_hash String
     updated_at DateTime64(3, 'UTC'),
     version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (job_name, chain_id);
+

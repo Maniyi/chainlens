@@ -1,7 +1,8 @@
 # ChainLens
 
-ChainLens is a small, production-style blockchain data project. Milestone 3 adds
-bounded wallet-intelligence derivation to the fork-aware Base/EVM ingestion layers.
+ChainLens is a small, production-style blockchain data project. Milestone 4 adds a
+versioned, provenance-first entity and wallet-labeling layer to the fork-aware
+Base/EVM ingestion and bounded wallet-intelligence layers.
 
 ## Architecture scope
 
@@ -19,11 +20,14 @@ The implemented scope contains:
 - canonical native/ERC-20 interaction edges, candidate first-funder provenance,
   lightweight wallet features, and explainable shared-funder entity edges;
 - deterministic connected components and candidate wallet clusters;
+- curated entity/address labels, explicit memberships, evidence, confidence, and
+  conservative cluster-based category propagation;
+- immutable label snapshots plus latest-completed read models;
 - a command-line health check plus deterministic unit and integration tests.
 
-Exchange/bridge/MEV/bot labels, deposit-address and common-spending heuristics, ML,
-GraphQL, streaming, evaluation/drift monitoring, and frontend work remain outside
-this milestone.
+MEV/searcher/sniper/bot classifiers, deposit-address and common-spending heuristics,
+ML, GraphQL, streaming, evaluation/drift monitoring, and frontend work remain
+outside this milestone.
 
 ## Local setup
 
@@ -49,6 +53,7 @@ RPC_BATCH_SIZE=20
 REORG_MAX_DEPTH=128
 CLUSTER_SHARED_FUNDER_WINDOW_SECONDS=3600
 CLUSTER_MAX_FUNDER_FANOUT=20
+LABEL_PROPAGATION_FACTOR=0.95
 ```
 
 ## Start ClickHouse
@@ -87,6 +92,12 @@ docker compose exec -T clickhouse clickhouse-client \
   --password chainlens \
   --database chainlens \
   --multiquery < warehouse/migrations/004_clustering_snapshot_history.sql
+
+docker compose exec -T clickhouse clickhouse-client \
+  --user chainlens \
+  --password chainlens \
+  --database chainlens \
+  --multiquery < warehouse/migrations/005_entity_labels.sql
 ```
 
 Migration `002` drops and recreates the affected ingestion and pipeline tables. This
@@ -308,6 +319,153 @@ Wallet feature inspection:
 SELECT * FROM chainlens.wallet_features
 WHERE chain_id = 8453 AND run_id = '<run-id>'
   AND wallet_address = '<wallet>';
+```
+
+## Entity and label model
+
+Milestone 4 never stores an unexplained flat label. A label assignment identifies
+its address or entity subject, dimension, value, confidence, assignment method,
+source type/reference, taxonomy version, label run, and timestamp. Separate evidence
+rows retain the human-readable reason and the inputs to propagated confidence.
+
+The `taxonomy_v1` taxonomy is intentionally small. Entity categories are `dex`,
+`exchange`, `bridge`, `protocol`, `token_issuer`, and `unknown`. Address-specific
+contract roles are `router`, `factory`, `pool_manager`, `position_manager`,
+`token_contract`, `protocol_contract`, `hot_wallet`, `deposit_wallet`, `deployer`,
+and `unknown`. An address need not have a role, and a role is never copied merely
+because two addresses are members of the same entity.
+
+Curated addresses with the same normalized `entity_name` share a stable entity ID:
+`seed_` plus SHA-256 over a length-prefixed encoding of `(chain_id,
+casefolded-and-whitespace-normalized entity_name)`. Cluster candidate entities use
+`cluster_` plus SHA-256 over `(chain_id, cluster_id)`. Execution UUIDs identify label
+runs only; they are not logical entity identities. A curated address that is also in
+a selected candidate cluster can therefore have both a `direct_seed` membership in
+its named curated entity and a `cluster_membership` in the candidate cluster entity.
+
+The curated Base CSV currently contains 17 lowercase addresses covering Uniswap,
+Aerodrome, Base WETH, Circle USDC, and Permit2. The loader validates the chain,
+address, required name, taxonomy values, provenance, and confidence range. Exact
+duplicate rows collapse; conflicting duplicate address rows fail. A deterministic
+`sha256:` digest over normalized, sorted semantic rows is stored as
+`seed_dataset_version`, so row order and CSV formatting do not identify the dataset.
+
+Direct and propagated assignments are deliberately different:
+
+```text
+DIRECT
+SwapRouter02 address
+  -> curated Uniswap entity
+  -> entity_category=dex, contract_role=router
+  -> official source reference, confidence=1.0
+
+PROPAGATED
+directly labeled address that is an actual selected-cluster member
+  -> candidate cluster entity
+  -> entity_category only for that entity and its unlabeled members
+  -> confidence = seed confidence * member confidence * propagation factor
+
+FORBIDDEN
+wallet transfers to or calls a Uniswap router
+  -/-> Uniswap, dex, or router label
+```
+
+The default propagation factor is `0.95`; the result is clamped to `[0,1]`. For
+example, `1.0 * 0.9569 * 0.95 = 0.909055`. This is a deterministic heuristic
+confidence, not a statistically calibrated probability. Evidence rows preserve the
+labeled source member, membership confidence, propagation factor, and original
+source. Direct confidence is not reduced when clustering also exists.
+
+Only membership from the selected `wallet_clusters` snapshot can trigger
+propagation. `wallet_transfer_edges` are never consulted. `entity_category` may
+propagate; `contract_role` never does. If one cluster contains direct seeds for
+different identities, both direct address labels remain, a
+`conflicting_direct_seed_identities` row records the ambiguity, the candidate entity
+stays unknown, and nothing propagates to unlabeled members.
+
+`entities`, `entity_members`, `label_assignments`, `label_evidence`, and
+`label_conflicts` retain immutable rows for every execution. `label_runs` appends
+higher-version state transitions. `latest_label_runs` resolves the newest completed
+execution per `(chain_id, cluster_run_id, taxonomy_version, seed_dataset_version)`
+without `FINAL`; failed or running executions never become current. The corresponding
+`current_*` views join only those completed snapshots. Physical historical tables
+remain directly queryable by `label_run_id`.
+
+## Run entity labeling
+
+Select a completed cluster run explicitly for reproducibility:
+
+```bash
+python -m chainlens.labels.runner run \
+  --chain-id 8453 \
+  --cluster-run-id <completed-cluster-run-uuid> \
+  --seed-file data/ground_truth/base_known_addresses.csv \
+  --taxonomy-version taxonomy_v1
+```
+
+Omitting `--cluster-run-id` is explicit direct-only mode; the runner does not guess
+among clustering scopes. Curated contracts are still represented and labeled when
+they do not occur in wallet clusters. A run can truthfully report zero propagated
+labels.
+
+## Inspect labels
+
+Direct labels and provenance for one address:
+
+```sql
+SELECT label_dimension, label_value, confidence, assignment_method,
+       source_type, source_reference, entity_id, label_run_id
+FROM chainlens.current_label_assignments
+WHERE chain_id = 8453
+  AND subject_type = 'address'
+  AND subject_id = '<address>';
+```
+
+Entity members and full evidence:
+
+```sql
+SELECT wallet_address, membership_method, membership_confidence,
+       cluster_id, cluster_run_id
+FROM chainlens.current_entity_members
+WHERE chain_id = 8453 AND entity_id = '<entity-id>'
+ORDER BY wallet_address;
+
+SELECT evidence_type, evidence_value, weight, confidence_contribution,
+       source_type, source_reference
+FROM chainlens.current_label_evidence
+WHERE chain_id = 8453 AND subject_id = '<address-or-entity-id>'
+ORDER BY label_dimension, evidence_type;
+```
+
+Current and historical labels:
+
+```sql
+SELECT * FROM chainlens.current_label_assignments
+WHERE chain_id = 8453;
+
+SELECT * FROM chainlens.label_assignments
+WHERE label_run_id = '<historical-label-run-id>';
+```
+
+Conflicts, named-entity addresses, and entities by category:
+
+```sql
+SELECT * FROM chainlens.current_label_conflicts
+WHERE chain_id = 8453;
+
+SELECT members.wallet_address, members.membership_method
+FROM chainlens.current_entity_members AS members
+INNER JOIN chainlens.current_entities AS entities
+  ON members.chain_id = entities.chain_id
+ AND members.label_run_id = entities.label_run_id
+ AND members.entity_id = entities.entity_id
+WHERE entities.chain_id = 8453 AND entities.display_name = 'Uniswap'
+ORDER BY members.wallet_address;
+
+SELECT entity_id, display_name, created_from
+FROM chainlens.current_entities
+WHERE chain_id = 8453 AND entity_category = 'dex'
+ORDER BY display_name, entity_id;
 ```
 
 ## Inspect ingestion state

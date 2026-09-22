@@ -1,7 +1,9 @@
 """ClickHouse schema and connectivity integration tests."""
 
 from collections.abc import Iterator
+import csv
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -12,6 +14,9 @@ from chainlens.clustering.runner import ClusterRunner
 from chainlens.clustering.store import ClickHouseClusteringStore
 from chainlens.evm.models import EvmBlock
 from chainlens.ingestion.store import ClickHouseStore
+from chainlens.labels.runner import LabelRunner
+from chainlens.labels.seeds import REQUIRED_COLUMNS
+from chainlens.labels.store import ClickHouseLabelStore
 
 
 BASE_TABLES = {
@@ -30,7 +35,15 @@ BASE_TABLES = {
     "cluster_evidence",
     "cluster_runs",
     "wallet_clusters",
+    "label_runs",
+    "entities",
+    "entity_members",
+    "label_assignments",
+    "label_evidence",
+    "label_conflicts",
 }
+
+GLOBAL_TABLES = {"label_taxonomy"}
 
 VIEWS = {
     "current_canonical_blocks",
@@ -43,6 +56,12 @@ VIEWS = {
     "current_wallet_features",
     "current_wallet_funding_edges",
     "current_wallet_transfer_edges",
+    "latest_label_runs",
+    "current_entities",
+    "current_entity_members",
+    "current_label_assignments",
+    "current_label_evidence",
+    "current_label_conflicts",
 }
 
 
@@ -81,7 +100,7 @@ def test_expected_tables_and_views_exist(client: Client) -> None:
     """The reorg-aware schema should expose all required objects."""
 
     names = {row[0] for row in client.query("SHOW TABLES FROM chainlens").result_rows}
-    assert BASE_TABLES <= names
+    assert BASE_TABLES | GLOBAL_TABLES <= names
     assert VIEWS <= names
 
 
@@ -457,3 +476,78 @@ def test_clustering_snapshots_are_historical_and_current_views_select_latest(
         "WHERE chain_id = {chain_id:UInt64} AND start_block = 800 AND end_block = 801",
         parameters={"chain_id": chain_id},
     ).result_rows == [(run_b,)]
+
+
+def test_label_snapshots_are_historical_and_failed_runs_do_not_become_current(
+    client: Client, chain_id: int, tmp_path: Path
+) -> None:
+    """Repeated logical inputs retain history and only the newest success is current."""
+
+    seed_path = tmp_path / "seeds.csv"
+    with seed_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=REQUIRED_COLUMNS)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "chain_id": chain_id,
+                "address": "0x" + "ab" * 20,
+                "entity_name": "Test Protocol",
+                "entity_category": "protocol",
+                "contract_role": "protocol_contract",
+                "source_type": "test_fixture",
+                "source_reference": "integration test",
+                "confidence": 1.0,
+                "notes": "known test contract",
+            }
+        )
+
+    store = ClickHouseLabelStore(client)
+    runner = LabelRunner(store, propagation_factor=0.95)
+    first = runner.run(chain_id, seed_path)
+    second = runner.run(chain_id, seed_path)
+    assert first.run_id != second.run_id
+    assert first.seed_dataset_version == second.seed_dataset_version
+    assert (first.seed_count, first.direct_label_count, first.entity_count) == (1, 3, 1)
+
+    historical = dict(
+        client.query(
+            "SELECT label_run_id, count() FROM chainlens.label_assignments "
+            "WHERE chain_id = {chain_id:UInt64} GROUP BY label_run_id",
+            parameters={"chain_id": chain_id},
+        ).result_rows
+    )
+    assert historical == {UUID(first.run_id): 3, UUID(second.run_id): 3}
+    assert client.query(
+        "SELECT DISTINCT label_run_id FROM chainlens.current_label_assignments "
+        "WHERE chain_id = {chain_id:UInt64}",
+        parameters={"chain_id": chain_id},
+    ).result_rows == [(UUID(second.run_id),)]
+
+    failed_run = uuid4()
+    now = datetime.now(UTC)
+    store.write_run_state(
+        failed_run,
+        chain_id,
+        None,
+        second.taxonomy_version,
+        second.seed_dataset_version,
+        "pending",
+        now,
+        1,
+    )
+    store.write_run_state(
+        failed_run,
+        chain_id,
+        None,
+        second.taxonomy_version,
+        second.seed_dataset_version,
+        "failed",
+        now,
+        2,
+        error="deliberate test failure",
+    )
+    assert client.query(
+        "SELECT run_id FROM chainlens.latest_label_runs "
+        "WHERE chain_id = {chain_id:UInt64}",
+        parameters={"chain_id": chain_id},
+    ).result_rows == [(UUID(second.run_id),)]

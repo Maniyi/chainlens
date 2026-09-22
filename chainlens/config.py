@@ -37,6 +37,12 @@ class Settings(BaseSettings):
         default=20,
         validation_alias="CLUSTER_MAX_FUNDER_FANOUT",
     )
+    label_propagation_factor: float = Field(
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+        validation_alias="LABEL_PROPAGATION_FACTOR",
+    )
 
 
 @lru_cache
