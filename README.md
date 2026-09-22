@@ -1,8 +1,8 @@
 # ChainLens
 
-ChainLens is a small, production-style blockchain data project. Milestone 5 adds a
-scoped evaluation and deterministic drift-monitoring layer to the fork-aware
-Base/EVM ingestion, wallet-intelligence, and entity-labeling layers.
+ChainLens is a small, production-style blockchain data project. Milestone 6 adds a
+read-only FastAPI and Strawberry GraphQL delivery layer over the fork-aware
+Base/EVM ingestion, wallet-intelligence, entity-labeling, and evaluation layers.
 
 ## Architecture scope
 
@@ -26,11 +26,14 @@ The implemented scope contains:
 - separate direct/inferred label evaluation, pairwise clustering evaluation,
   coverage statistics, operational drift metrics, and rule-based alerts;
 - immutable evaluation history plus latest-completed compatible-scope views;
-- a command-line health check plus deterministic unit and integration tests.
+- a read-only GraphQL API for wallets, entities, clusters, label provenance,
+  evaluation metrics, and drift alerts;
+- lightweight HTTP liveness/readiness endpoints plus deterministic unit and
+  integration tests.
 
 MEV/searcher/sniper/bot classifiers, deposit-address and common-spending heuristics,
-ML, GraphQL, streaming, alert delivery, and frontend work remain outside this
-milestone.
+ML, GraphQL mutations/subscriptions, authentication, rate limiting, streaming,
+alert delivery, deployment, and frontend work remain outside this milestone.
 
 ## Local setup
 
@@ -662,7 +665,177 @@ FROM chainlens.pipeline_checkpoints
 WHERE job_name = 'block_ingestion' AND chain_id = 8453;
 ```
 
-## Run the health check
+## Run the GraphQL API
+
+Start the local read-only API from the project environment:
+
+```bash
+python -m chainlens.api.app
+```
+
+The GraphQL endpoint (including the local GraphiQL explorer) is
+`http://127.0.0.1:8000/graphql`. `GET /health` reports process liveness without a
+warehouse query. `GET /readiness` executes `SELECT 1` and returns HTTP 503 when
+ClickHouse is unavailable.
+
+Default reads resolve the newest completed cluster, label, or evaluation execution
+for the requested chain and then read its matching `current_*` view. An explicit
+`clusterRunId`, `labelRunId`, or `evaluationRunId` reads the immutable historical
+table instead. Explicit IDs must exist, belong to the requested chain, and be
+completed; invalid or incompatible IDs produce a GraphQL error and never fall back
+to current data. Snapshot metadata on responses identifies the selected runs and
+semantic versions.
+
+Wallet lookup, including nullable intelligence when a valid address has no current
+features, entity, or cluster:
+
+```graphql
+query {
+  wallet(chainId: 8453, address: "0x0000000000000000000000000000000000000000") {
+    address
+    chainId
+    features {
+      firstSeenBlock
+      lastSeenBlock
+      uniqueCounterparties
+      nativeReceivedWei
+      nativeSentWei
+      firstFunderAddress
+    }
+    entity {
+      id
+      displayName
+      category
+      membershipMethod
+      membershipConfidence
+    }
+    cluster { id size confidence heuristicVersion }
+    labels {
+      dimension
+      value
+      confidence
+      assignmentMethod
+      sourceType
+      sourceReference
+      taxonomyVersion
+      evidence { type value weight confidenceContribution }
+    }
+    snapshot { clusterRunId labelRunId heuristicVersion taxonomyVersion }
+  }
+}
+```
+
+Entity lookup and bounded membership:
+
+```graphql
+query {
+  entity(chainId: 8453, id: "entity-id") {
+    id
+    displayName
+    category
+    clusterId
+    members(limit: 20, offset: 0) {
+      address
+      membershipMethod
+      membershipConfidence
+    }
+    labels { dimension value sourceType sourceReference }
+  }
+}
+```
+
+Cluster membership, resolution edges, and evidence:
+
+```graphql
+query {
+  cluster(chainId: 8453, id: "cluster-id") {
+    id
+    size
+    confidence
+    members(limit: 20) { address confidence }
+    resolutionEdges(limit: 50) {
+      walletA
+      walletB
+      heuristic
+      score
+      evidenceCount
+    }
+    evidence(limit: 50) {
+      evidenceType
+      evidenceValue
+      weight
+      scoreContribution
+    }
+  }
+}
+```
+
+Current evaluation and drift:
+
+```graphql
+query {
+  evaluation(chainId: 8453) {
+    runId
+    clusterRunId
+    labelRunId
+    groundTruthVersion
+    evaluationVersion
+    labelMetrics { labelDimension precision recall f1 support coverage }
+    clusteringMetrics {
+      metricScope
+      pairwisePrecision
+      pairwiseRecall
+      pairwiseF1
+      evaluatedAddressCount
+    }
+    coverageMetrics { metricName value previousValue }
+    alerts { severity metricName message createdAt }
+  }
+  driftAlerts(chainId: 8453, severity: "warning", limit: 50) {
+    severity
+    metricName
+    scopeKey
+    message
+  }
+}
+```
+
+Historical selection uses GraphQL's UUID scalar:
+
+```graphql
+query Historical($clusterRun: UUID!, $labelRun: UUID!, $evaluationRun: UUID!) {
+  wallet(
+    chainId: 8453
+    address: "0x0000000000000000000000000000000000000000"
+    clusterRunId: $clusterRun
+    labelRunId: $labelRun
+  ) { address snapshot { clusterRunId labelRunId } }
+  evaluation(chainId: 8453, evaluationRunId: $evaluationRun) {
+    runId
+    snapshot { groundTruthVersion evaluationVersion }
+  }
+}
+```
+
+List and nested collection arguments default to 50 rows. `limit` must be between 1
+and 500; larger values are rejected consistently. `offset` must be between 0 and
+100,000. Queries select named columns and push chain, run, identity, limit, and
+offset filters into ClickHouse. Nested members/edges/evidence are fetched only when
+selected, so a top-level list does not automatically cause per-item warehouse
+queries. Selecting a nested collection for many list results still performs one
+bounded query per result; a DataLoader is intentionally deferred until usage
+patterns justify it.
+
+EVM `UInt256` values such as native wei totals are exposed as decimal `String`
+fields because GraphQL `Int` is only a signed 32-bit value. Nullable warehouse
+metrics remain GraphQL `null`; undefined precision or F1 is never rewritten to
+zero. Timestamps use GraphQL's ISO-8601 `DateTime` scalar.
+
+This is a local/demo API. It intentionally has no authentication, authorization,
+API keys, rate limiting, production TLS, deployment configuration, or broad CORS
+policy. Those are operational concerns for a future production milestone.
+
+## Run the command-line health check
 
 ```bash
 python -m chainlens.health
